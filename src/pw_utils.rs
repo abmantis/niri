@@ -2,14 +2,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::iter::zip;
-use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::rc::Rc;
 use std::time::Duration;
+use std::{mem, slice};
 
 use anyhow::Context as _;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
+use pipewire::buffer::Buffer;
 use pipewire::context::Context;
 use pipewire::core::{Core, PW_ID_CORE};
 use pipewire::main_loop::MainLoop;
@@ -24,7 +25,7 @@ use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{self, ChoiceValue, Pod, PodPropFlags, Property, PropertyFlags};
 use pipewire::spa::sys::*;
 use pipewire::spa::utils::{
-    Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes,
+    Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Id, Rectangle, SpaTypes,
 };
 use pipewire::spa::{self};
 use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamState};
@@ -40,7 +41,7 @@ use smithay::output::{Output, OutputModeSource};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{Physical, Scale, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
@@ -50,6 +51,12 @@ use crate::utils::get_monotonic_time;
 
 // Give a 0.1 ms allowance for presentation time errors.
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
+
+const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_ARGB;
+const CURSOR_BPP: u32 = 4;
+const CURSOR_WIDTH: u32 = 24;
+const CURSOR_HEIGHT: u32 = 24;
+const MAX_CURSOR_BITMAP_SIZE: usize = (CURSOR_WIDTH * CURSOR_HEIGHT * CURSOR_BPP) as usize;
 
 pub struct PipeWire {
     _context: Context,
@@ -102,6 +109,7 @@ pub enum CastState {
         plane_count: i32,
         // Lazily-initialized to keep the initialization to a single place.
         damage_tracker: Option<OutputDamageTracker>,
+        last_pointer_location: Option<Point<f64, Logical>>,
     },
 }
 
@@ -454,6 +462,7 @@ impl PipeWire {
                                 modifier,
                                 plane_count,
                                 damage_tracker,
+                                last_pointer_location: None,
                             };
 
                             plane_count
@@ -487,6 +496,7 @@ impl PipeWire {
                                 modifier,
                                 plane_count: plane_count as i32,
                                 damage_tracker: None,
+                                last_pointer_location: None,
                             };
 
                             plane_count as i32
@@ -527,23 +537,31 @@ impl PipeWire {
                         ),
                     );
 
-                    // FIXME: Hidden / embedded / metadata cursor
-
-                    // let o2 = pod::object!(
-                    //     SpaTypes::ObjectParamMeta,
-                    //     ParamType::Meta,
-                    //     Property::new(SPA_PARAM_META_type,
-                    // pod::Value::Id(Id(SPA_META_Header))),
-                    //     Property::new(
-                    //         SPA_PARAM_META_size,
-                    //         pod::Value::Int(size_of::<spa_meta_header>() as i32)
-                    //     ),
-                    // );
                     let mut b1 = vec![];
-                    // let mut b2 = vec![];
-                    let mut params = [
-                        make_pod(&mut b1, o1), // make_pod(&mut b2, o2)
-                    ];
+                    let mut params = vec![make_pod(&mut b1, o1)];
+
+                    let mut b_cursor = vec![];
+                    match cursor_mode {
+                        CursorMode::Metadata => {
+                            let cursor_meta_size = mem::size_of::<spa_meta_cursor>()
+                                + mem::size_of::<spa_meta_bitmap>()
+                                + MAX_CURSOR_BITMAP_SIZE;
+                            let o_cursor = pod::object!(
+                                SpaTypes::ObjectParamMeta,
+                                ParamType::Meta,
+                                Property::new(
+                                    SPA_PARAM_META_type,
+                                    pod::Value::Id(Id(SPA_META_Cursor))
+                                ),
+                                Property::new(
+                                    SPA_PARAM_META_size,
+                                    pod::Value::Int(cursor_meta_size as i32)
+                                ),
+                            );
+                            params.push(make_pod(&mut b_cursor, o_cursor));
+                        }
+                        _ => {}
+                    }
 
                     if let Err(err) = stream.update_params(&mut params) {
                         warn!("error updating stream params: {err:?}");
@@ -816,6 +834,84 @@ impl Cast {
         }
     }
 
+    fn draw_cursor_bitmap(bitmap: &mut [u32]) {
+        let size = std::cmp::min(CURSOR_WIDTH, CURSOR_HEIGHT);
+        let radius = (size / 2) as i32;
+        let radius_sq = radius * radius;
+        let border = radius_sq / 3;
+
+        for x in 0..CURSOR_WIDTH {
+            let dx = x as i32 - radius;
+            for y in 0..CURSOR_HEIGHT {
+                let dy = y as i32 - radius;
+                let dist = dx * dx + dy * dy;
+                let index = (x + y * CURSOR_WIDTH) as usize;
+                if dist < (radius_sq - border) {
+                    bitmap[index] = 0xAAFFFFFF;
+                } else if dist <= radius_sq {
+                    bitmap[index] = 0xAA000000;
+                } else {
+                    bitmap[index] = 0x00000000;
+                }
+            }
+        }
+    }
+
+    fn add_cursor_metadata(buffer: &mut Buffer, pointer_location: &Point<f64, Logical>) {
+        match buffer.with_meta_data(SPA_META_Cursor, |cursor_meta: &mut spa_meta_cursor| {
+            trace!("writing cursor metadata");
+            cursor_meta.id = 1;
+            cursor_meta.position.x =
+                (pointer_location.x - (CURSOR_WIDTH as f64 / 2.0)).round() as i32;
+            cursor_meta.position.y =
+                (pointer_location.y - (CURSOR_HEIGHT as f64 / 2.0)).round() as i32;
+            cursor_meta.hotspot.x = 0;
+            cursor_meta.hotspot.y = 0;
+
+            // TODO: Can the bitmap be initialized previously in start_cast?
+            // Alternativelly, initialize on first pass. For this, bitmap_offset must be 0 on
+            // subsequent passes.
+            cursor_meta.bitmap_offset = mem::size_of::<spa_meta_cursor>() as _;
+
+            let cursor_meta_ptr = cursor_meta as *mut spa_meta_cursor;
+
+            let bitmap_meta_ptr = unsafe {
+                cursor_meta_ptr
+                    .cast::<u8>()
+                    .offset(cursor_meta.bitmap_offset as _)
+                    .cast::<spa_meta_bitmap>()
+            };
+            if let Some(bitmap_meta) = unsafe { bitmap_meta_ptr.as_mut() } {
+                bitmap_meta.format = CURSOR_FORMAT;
+                bitmap_meta.size.width = CURSOR_WIDTH;
+                bitmap_meta.size.height = CURSOR_HEIGHT;
+                bitmap_meta.stride = (bitmap_meta.size.width * CURSOR_BPP) as _;
+
+                bitmap_meta.offset = mem::size_of::<spa_meta_bitmap>() as _;
+                let bitmap_data = unsafe {
+                    bitmap_meta_ptr
+                        .cast::<u8>()
+                        .offset(bitmap_meta.offset as _)
+                        .cast::<u32>()
+                };
+
+                let bitmap_slice = unsafe {
+                    slice::from_raw_parts_mut(bitmap_data, MAX_CURSOR_BITMAP_SIZE as usize)
+                };
+                Self::draw_cursor_bitmap(bitmap_slice);
+            } else {
+                warn!("no cursor bitmap metadata found in buffer");
+            }
+        }) {
+            None => {
+                warn!("no cursor metadata found in buffer");
+            }
+            Some(_) => {
+                trace!("cursor metadata written successfully");
+            }
+        }
+    }
+
     pub fn dequeue_buffer_and_render(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -823,8 +919,14 @@ impl Cast {
         size: Size<i32, Physical>,
         scale: Scale<f64>,
         wait_for_sync: bool,
+        pointer_location: Option<Point<f64, Logical>>,
     ) -> bool {
-        let CastState::Ready { damage_tracker, .. } = &mut *self.state.borrow_mut() else {
+        let CastState::Ready {
+            damage_tracker,
+            last_pointer_location,
+            ..
+        } = &mut *self.state.borrow_mut()
+        else {
             error!("cast must be in Ready state to render");
             return false;
         };
@@ -840,15 +942,20 @@ impl Cast {
         }
 
         let (damage, _states) = damage_tracker.damage_output(1, elements).unwrap();
-        if damage.is_none() {
+        if damage.is_none() && *last_pointer_location == pointer_location {
             trace!("no damage, skipping frame");
             return false;
         }
+        *last_pointer_location = pointer_location;
 
         let Some(mut buffer) = self.stream.dequeue_buffer() else {
             warn!("no available buffer in pw stream, skipping frame");
             return false;
         };
+
+        if let Some(pointer) = pointer_location {
+            Self::add_cursor_metadata(&mut buffer, &pointer);
+        }
 
         let fd = buffer.datas_mut()[0].as_raw().fd;
         let dmabuf = &self.dmabufs.borrow()[&fd];
